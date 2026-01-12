@@ -279,11 +279,11 @@ void CloudProjection::initFromPoints(const pcl::PointCloud<pcl::PointXYZIT>::Con
     uint16_t intensity = 0;
     if (point.intensity != 0.0f) {
       if (point.intensity < 0.0f) {
-        // Aeva dBm: typically -20 to -120 dBm
+        // Aeva dBm: adjusted range based on actual observed data [-73, -38] dBm
         float dbm_val = -point.intensity;  // Make positive
-        dbm_val = std::max(20.0f, std::min(dbm_val, 120.0f));  // Clamp to [20, 120]
-        // Map [20, 120] dBm to [65535, 0] - stronger signal (lower dBm magnitude) = brighter
-        intensity = (uint16_t)(((120.0f - dbm_val) / 100.0f) * 65535.0f);
+        dbm_val = std::max(38.0f, std::min(dbm_val, 75.0f));  // Clamp to [38, 75] - matches your data
+        // Map [38, 75] dBm to [65535, 0] - stronger signal (lower dBm magnitude) = brighter
+        intensity = (uint16_t)(((75.0f - dbm_val) / 37.0f) * 65535.0f);
       } else {
         // Positive intensity (non-Aeva lidars)
         float intensity_val = std::max(0.0f, std::min(point.intensity, 255.0f));
