@@ -34,6 +34,14 @@ struct EIGEN_ALIGN16 PointXYZIFN {
     uint16_t noise;
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
+
+//X,Y,Z,intensity,time_offset_ns for Aeva lidar (with motion compensation support)
+struct EIGEN_ALIGN16 PointXYZIT {
+    PCL_ADD_POINT4D;
+    float    intensity;                 ///< laser intensity reading (dBm for Aeva)
+    int32_t  time_offset_ns;            ///< time offset in nanoseconds from scan start
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW     // ensure proper alignment
+};
 }
 
 POINT_CLOUD_REGISTER_POINT_STRUCT(pcl::PointXYZIR,
@@ -59,6 +67,14 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(pcl::PointXYZIFN,
     (uint16_t, intensity, intensity)
     (uint16_t, reflectivity, reflectivity)
     (uint16_t, noise, noise)
+)
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(pcl::PointXYZIT,
+    (float, x, x)
+    (float, y, y)
+    (float, z, z)
+    (float, intensity, intensity)
+    (int32_t, time_offset_ns, time_offset_ns)
 )
 
 

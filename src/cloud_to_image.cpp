@@ -12,6 +12,8 @@
 #include <opencv2/highgui/highgui.hpp>
 #include <cv_bridge/cv_bridge.hpp>
 
+#include <Eigen/Core>
+
 #include <boost/algorithm/string.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
 
@@ -30,7 +32,9 @@ CloudToImage::CloudToImage():
 	_flip(false),
 	_fill_gaps(true),  // Enable gap filling by default
 	_overlapping(0),
-	_output_mode(ImageOutputMode::SINGLE)
+	_output_mode(ImageOutputMode::SINGLE),
+	_motion_compensation(false),
+	_has_odom_data(false)
 {
 	_depth_image = cv::Mat::zeros(1, 1, CV_32FC1);
 	_intensity_image = cv::Mat::zeros(1, 1, CV_16UC1);
@@ -38,6 +42,9 @@ CloudToImage::CloudToImage():
 	_noise_image = cv::Mat::zeros(1, 1, CV_16UC1);	
 	_group_image = cv::Mat::zeros(1, 1, CV_16UC1);
 	_stack_image = cv::Mat::zeros(1, 1, CV_16UC3);
+	
+	_latest_linear_velocity = Eigen::Vector3f::Zero();
+	_latest_angular_velocity = Eigen::Vector3f::Zero();
 }
 
 CloudToImage::~CloudToImage() 
@@ -133,6 +140,9 @@ void CloudToImage::init()
 		_has_intensity_image = true;
 		_has_reflectance_image = true;
 		_has_noise_image = true;
+	} else if (boost::iequals(_point_type, "XYZIT")) { //with intensity and time offset (ex. Aeva)
+		_has_depth_image = true;
+		_has_intensity_image = true;
 	} else {
 		throw std::runtime_error("point type \"" + _point_type + "\" not supported");
 	}
@@ -153,6 +163,24 @@ void CloudToImage::init()
 	//creates the cloud projection for the sensor model
 	_cloud_proj = new CloudProjection(*proj_params[_sensor_model]);
 
+	// Motion compensation setup - read from odometry topic instead of static parameters
+	_motion_compensation = getParam("motion_compensation", false);
+	_odom_topic = getParam("odom_topic", std::string("/vtr/odometry"));
+	
+	// Initialize motion compensation with zero velocity (will be updated from odometry)
+	_cloud_proj->setMotionCompensation(_motion_compensation, 
+		Eigen::Vector3f::Zero(), 
+		Eigen::Vector3f::Zero());
+		
+	if (_motion_compensation) {
+		if (!boost::iequals(_point_type, "XYZIT")) {
+			RCLCPP_WARN(this->get_logger(), 
+				"motion_compensation enabled but point_type is not XYZIT; time offsets will be ignored");
+		}
+		RCLCPP_INFO(this->get_logger(), 
+			"Motion compensation enabled, subscribing to odometry topic: %s", _odom_topic.c_str());
+	}
+
 	//Mossman corrections seem to help on Velodyne
 	if (boost::iequals(_sensor_model, "HDL-64") || boost::iequals(_sensor_model, "HDL-32") || boost::iequals(_sensor_model, "VLP-16")) {
 		_cloud_proj->loadMossmanCorrections();
@@ -162,6 +190,13 @@ void CloudToImage::init()
 	_sub_PointCloud = this->create_subscription<sensor_msgs::msg::PointCloud2>(
 		_cloud_topic, 10, 
 		std::bind(&CloudToImage::pointCloudCallback, this, std::placeholders::_1));
+	
+	// Subscribe to odometry if motion compensation is enabled
+	if (_motion_compensation) {
+		_sub_Odometry = this->create_subscription<nav_msgs::msg::Odometry>(
+			_odom_topic, 10,
+			std::bind(&CloudToImage::odometryCallback, this, std::placeholders::_1));
+	}
 	
 	//publishers
 	if (_output_mode == ImageOutputMode::GROUP || _output_mode == ImageOutputMode::ALL) {
@@ -186,8 +221,42 @@ void CloudToImage::init()
 	RCLCPP_INFO(this->get_logger(), "Cloud2Image node initialized successfully");
 }
 
+void CloudToImage::odometryCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
+{
+	// Extract linear and angular velocity from odometry message
+	_latest_linear_velocity = Eigen::Vector3f(
+		msg->twist.twist.linear.x,
+		msg->twist.twist.linear.y,
+		msg->twist.twist.linear.z
+	);
+	
+	_latest_angular_velocity = Eigen::Vector3f(
+		msg->twist.twist.angular.x,
+		msg->twist.twist.angular.y,
+		msg->twist.twist.angular.z
+	);
+	
+	_has_odom_data = true;
+	
+	// Update motion compensation with latest velocity
+	if (_motion_compensation) {
+		_cloud_proj->setMotionCompensation(true, _latest_linear_velocity, _latest_angular_velocity);
+	}
+}
+
 void CloudToImage::pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr input)
 {
+	// Warn if motion compensation is enabled but no odometry data received yet
+	if (_motion_compensation && !_has_odom_data) {
+		static bool warned = false;
+		if (!warned) {
+			RCLCPP_WARN(this->get_logger(), 
+				"Motion compensation enabled but no odometry data received yet on topic: %s", 
+				_odom_topic.c_str());
+			warned = true;
+		}
+	}
+	
 	//clear any previous projection data
 	_cloud_proj->clearData();
 
@@ -215,6 +284,11 @@ void CloudToImage::pointCloudCallback(const sensor_msgs::msg::PointCloud2::Share
 		pcl::PointCloud<pcl::PointXYZIFN>::Ptr cloud_ptr(new pcl::PointCloud<pcl::PointXYZIFN>);	
 		pcl::fromROSMsg(*input, *cloud_ptr);
 		const pcl::PointCloud<pcl::PointXYZIFN>::ConstPtr c_cloud_ptr(&(*cloud_ptr), &CloudToImage::DoNotFree< pcl::PointCloud<pcl::PointXYZIFN> >);
+		_cloud_proj->initFromPoints(c_cloud_ptr);
+	} else if (boost::iequals(_point_type, "XYZIT")) { 
+		pcl::PointCloud<pcl::PointXYZIT>::Ptr cloud_ptr(new pcl::PointCloud<pcl::PointXYZIT>);	
+		pcl::fromROSMsg(*input, *cloud_ptr);
+		const pcl::PointCloud<pcl::PointXYZIT>::ConstPtr c_cloud_ptr(&(*cloud_ptr), &CloudToImage::DoNotFree< pcl::PointCloud<pcl::PointXYZIT> >);
 		_cloud_proj->initFromPoints(c_cloud_ptr);
 	}
 
@@ -564,11 +638,13 @@ void CloudToImage::saveImages(const std::string& base_name)
 
 void CloudToImage::fillGaps(cv::Mat& image, int method)
 {
-	// Multi-pass gap filling to match Ouster's default image quality
-	// Pass 1: Small horizontal gaps with strict similarity
-	// Pass 2: Medium horizontal gaps with relaxed similarity
+	// Multi-pass gap filling optimized for both organized (Ouster) and unorganized (Aeva) point clouds
+	// For unorganized clouds with motion distortion, we use moderate gap filling to avoid artifacts
+	// Pass 1: Small horizontal gaps with strict similarity (1-3 pixels)
+	// Pass 2: Medium horizontal gaps with relaxed similarity (4-8 pixels)  
 	// Pass 3: Vertical interpolation with consistency check
-	// Pass 4: Diagonal/neighbor interpolation for remaining gaps
+	// Pass 4: 8-neighbor averaging (conservative - at least 5 neighbors)
+	// Pass 5: 8-neighbor averaging (moderate - at least 4 neighbors)
 	
 	(void)method;  // Method parameter reserved for future use
 	
@@ -647,7 +723,7 @@ void CloudToImage::fillGaps(cv::Mat& image, int method)
 			}
 		}
 		
-		// Pass 4: Conservative neighbor average for remaining isolated gaps only
+		// Pass 4: Conservative neighbor average (at least 5 neighbors)
 		for (int row = 1; row < image.rows - 1; row++) {
 			float* prev_row = image.ptr<float>(row - 1);
 			float* curr_row = image.ptr<float>(row);
@@ -668,21 +744,45 @@ void CloudToImage::fillGaps(cv::Mat& image, int method)
 					if (next_row[col] > 0.0f) neighbors.push_back(next_row[col]);
 					if (next_row[col+1] > 0.0f) neighbors.push_back(next_row[col+1]);
 					
-					// Only fill if we have at least 5 neighbors AND they are similar (not scattered)
+					// Fill if we have at least 5 neighbors
 					if (neighbors.size() >= 5) {
 						float sum = 0.0f;
-						float min_val = neighbors[0];
-						float max_val = neighbors[0];
 						for (float val : neighbors) {
 							sum += val;
-							min_val = std::min(min_val, val);
-							max_val = std::max(max_val, val);
 						}
-						
-						// Only fill if neighbors are consistent (within 25% range)
-						if ((max_val - min_val) / max_val < 0.25f) {
-							curr_row[col] = sum / neighbors.size();
+						curr_row[col] = sum / neighbors.size();
+					}
+				}
+			}
+		}
+		
+		// Pass 5: Second neighbor pass (at least 4 neighbors)
+		for (int row = 1; row < image.rows - 1; row++) {
+			float* prev_row = image.ptr<float>(row - 1);
+			float* curr_row = image.ptr<float>(row);
+			float* next_row = image.ptr<float>(row + 1);
+			
+			for (int col = 1; col < image.cols - 1; col++) {
+				if (curr_row[col] == 0.0f) {
+					std::vector<float> neighbors;
+					neighbors.reserve(8);
+					
+					if (prev_row[col-1] > 0.0f) neighbors.push_back(prev_row[col-1]);
+					if (prev_row[col] > 0.0f) neighbors.push_back(prev_row[col]);
+					if (prev_row[col+1] > 0.0f) neighbors.push_back(prev_row[col+1]);
+					if (curr_row[col-1] > 0.0f) neighbors.push_back(curr_row[col-1]);
+					if (curr_row[col+1] > 0.0f) neighbors.push_back(curr_row[col+1]);
+					if (next_row[col-1] > 0.0f) neighbors.push_back(next_row[col-1]);
+					if (next_row[col] > 0.0f) neighbors.push_back(next_row[col]);
+					if (next_row[col+1] > 0.0f) neighbors.push_back(next_row[col+1]);
+					
+					// Fill if we have at least 4 neighbors
+					if (neighbors.size() >= 4) {
+						float sum = 0.0f;
+						for (float val : neighbors) {
+							sum += val;
 						}
+						curr_row[col] = sum / neighbors.size();
 					}
 				}
 			}
@@ -764,7 +864,7 @@ void CloudToImage::fillGaps(cv::Mat& image, int method)
 			}
 		}
 		
-		// Pass 4: Conservative neighbor average for remaining isolated gaps only
+		// Pass 4: Neighbor average (at least 5 neighbors)
 		for (int row = 1; row < image.rows - 1; row++) {
 			uint16_t* prev_row = image.ptr<uint16_t>(row - 1);
 			uint16_t* curr_row = image.ptr<uint16_t>(row);
@@ -772,7 +872,6 @@ void CloudToImage::fillGaps(cv::Mat& image, int method)
 			
 			for (int col = 1; col < image.cols - 1; col++) {
 				if (curr_row[col] == 0) {
-					// Collect valid neighbors (8-connected)
 					std::vector<uint16_t> neighbors;
 					neighbors.reserve(8);
 					
@@ -785,21 +884,45 @@ void CloudToImage::fillGaps(cv::Mat& image, int method)
 					if (next_row[col] > 0) neighbors.push_back(next_row[col]);
 					if (next_row[col+1] > 0) neighbors.push_back(next_row[col+1]);
 					
-					// Only fill if we have at least 5 neighbors AND they are similar
+					// Fill if we have at least 5 neighbors
 					if (neighbors.size() >= 5) {
 						int sum = 0;
-						uint16_t min_val = neighbors[0];
-						uint16_t max_val = neighbors[0];
 						for (uint16_t val : neighbors) {
 							sum += val;
-							min_val = std::min(min_val, val);
-							max_val = std::max(max_val, val);
 						}
-						
-						// Only fill if neighbors are consistent (within 30% range)
-						if (max_val > 0 && (max_val - min_val) * 100 / max_val < 30) {
-							curr_row[col] = (uint16_t)(sum / neighbors.size());
+						curr_row[col] = (uint16_t)(sum / neighbors.size());
+					}
+				}
+			}
+		}
+		
+		// Pass 5: Second neighbor pass (at least 4 neighbors)
+		for (int row = 1; row < image.rows - 1; row++) {
+			uint16_t* prev_row = image.ptr<uint16_t>(row - 1);
+			uint16_t* curr_row = image.ptr<uint16_t>(row);
+			uint16_t* next_row = image.ptr<uint16_t>(row + 1);
+			
+			for (int col = 1; col < image.cols - 1; col++) {
+				if (curr_row[col] == 0) {
+					std::vector<uint16_t> neighbors;
+					neighbors.reserve(8);
+					
+					if (prev_row[col-1] > 0) neighbors.push_back(prev_row[col-1]);
+					if (prev_row[col] > 0) neighbors.push_back(prev_row[col]);
+					if (prev_row[col+1] > 0) neighbors.push_back(prev_row[col+1]);
+					if (curr_row[col-1] > 0) neighbors.push_back(curr_row[col-1]);
+					if (curr_row[col+1] > 0) neighbors.push_back(curr_row[col+1]);
+					if (next_row[col-1] > 0) neighbors.push_back(next_row[col-1]);
+					if (next_row[col] > 0) neighbors.push_back(next_row[col]);
+					if (next_row[col+1] > 0) neighbors.push_back(next_row[col+1]);
+					
+					// Fill if we have at least 4 neighbors
+					if (neighbors.size() >= 4) {
+						int sum = 0;
+						for (uint16_t val : neighbors) {
+							sum += val;
 						}
+						curr_row[col] = (uint16_t)(sum / neighbors.size());
 					}
 				}
 			}
@@ -808,4 +931,3 @@ void CloudToImage::fillGaps(cv::Mat& image, int method)
 }
 
 }
-

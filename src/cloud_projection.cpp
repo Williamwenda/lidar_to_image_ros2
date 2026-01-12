@@ -66,6 +66,23 @@ CloudProjection::CloudProjection(const SensorParams& params)
   clearCorrections();
 }
 
+void CloudProjection::setMotionCompensation(bool enable,
+                                            const Eigen::Vector3f& linear_velocity,
+                                            const Eigen::Vector3f& angular_velocity)
+{
+  _use_motion_compensation = enable;
+  _linear_velocity = linear_velocity;
+  _angular_velocity = angular_velocity;
+  
+  if (enable) {
+    std::cout << "Motion compensation enabled:" << std::endl;
+    std::cout << "  Linear velocity: [" << linear_velocity.x() << ", " 
+              << linear_velocity.y() << ", " << linear_velocity.z() << "] m/s" << std::endl;
+    std::cout << "  Angular velocity: [" << angular_velocity.x() << ", " 
+              << angular_velocity.y() << ", " << angular_velocity.z() << "] rad/s" << std::endl;
+  }
+}
+
 void CloudProjection::clearData() 
 {
   _data = PointMatrix(_params.cols(), PointColumn(_params.rows()));
@@ -101,8 +118,8 @@ void CloudProjection::initFromPoints(const pcl::PointCloud<pcl::PointXYZ>::Const
     // adding point pointer
     this->at(bin_rows, bin_cols).points().push_back(index);
     auto& current_written_depth = this->_depth_image.template at<float>(bin_rows, bin_cols);
-    if (current_written_depth < dist_to_sensor) {
-      // write this point to the image only if it is closer
+    if (current_written_depth <= 0.0f || dist_to_sensor < current_written_depth) {
+      // keep the closest point per pixel to reduce occlusion artifacts
       current_written_depth = dist_to_sensor;
     }
   }
@@ -112,31 +129,185 @@ void CloudProjection::initFromPoints(const pcl::PointCloud<pcl::PointXYZ>::Const
 void CloudProjection::initFromPoints(const pcl::PointCloud<pcl::PointXYZI>::ConstPtr& cloud) 
 {
   this->checkCloudAndStorage<pcl::PointCloud<pcl::PointXYZI>::ConstPtr>(cloud);
+  
+  // Track intensity range and projection success for debugging
+  float min_intensity = std::numeric_limits<float>::max();
+  float max_intensity = std::numeric_limits<float>::lowest();
+  int non_zero_intensity_points = 0;
+  int projected_points = 0;
+  int skipped_too_close = 0;
+  
   for (size_t index = 0; index < cloud->points.size(); ++index) {
     const auto& point = cloud->points[index];
     float dist_to_sensor = std::sqrt(point.x*point.x + point.y*point.y + point.z*point.z);
-    // For Ouster, intensity is typically already in a reasonable range (0-10000 or similar)
-    // Clamp to uint16_t range without rescaling from 255
-    uint16_t intensity = (uint16_t)std::min(std::max(point.intensity, 0.0f), 65535.0f);
     
     if (dist_to_sensor < 0.01f) {
+      skipped_too_close++;
       continue;
     }
+    
+    // Track intensity range (including negative values)
+    if (point.intensity != 0.0f) {
+      min_intensity = std::min(min_intensity, point.intensity);
+      max_intensity = std::max(max_intensity, point.intensity);
+      non_zero_intensity_points++;
+    }
+    
+    // Scale intensity for visualization
+    // Aeva FMCW lidar uses negative dBm values (typically -20 to -120 dBm)
+    uint16_t intensity;
+    
+    if (point.intensity < 0.0f) {
+      // Negative dBm values: map to 0-65535
+      // Typical range: -20 (strong) to -120 (weak)
+      // Invert so stronger returns = brighter pixels
+      float dbm_val = -point.intensity;  // Make positive
+      // Clamp to reasonable range and normalize
+      dbm_val = std::max(20.0f, std::min(dbm_val, 120.0f));
+      // Map [20, 120] to [65535, 0] (inverted - stronger signal = brighter)
+      intensity = (uint16_t)(((120.0f - dbm_val) / 100.0f) * 65535.0f);
+    } else if (point.intensity > 0.0f && point.intensity < 100.0f) {
+      // Small positive values - scale up
+      intensity = (uint16_t)std::min(point.intensity * 655.0f, 65535.0f);
+    } else if (point.intensity >= 100.0f) {
+      // Already in reasonable range
+      intensity = (uint16_t)std::min(point.intensity, 65535.0f);
+    } else {
+      // Zero intensity - keep as zero
+      intensity = 0;
+    }
+    
     auto angle_rows = Angle::fromRadians(asin(point.z / dist_to_sensor));
     auto angle_cols = Angle::fromRadians(atan2(point.y, point.x));
     size_t bin_rows = this->_params.rowFromAngle(angle_rows);
     size_t bin_cols = this->_params.colFromAngle(angle_cols);
-    //std::cout << point.x << "," << point.y << "," << point.z << "," << dist_to_sensor << "," << angle_rows.toDegrees() << "," << angle_cols.toDegrees() << "," << bin_rows << "," << bin_cols << "," << std::endl;
+    
     // adding point pointer
     this->at(bin_rows, bin_cols).points().push_back(index);
     auto& current_written_depth = this->_depth_image.template at<float>(bin_rows, bin_cols);
     auto& current_written_intensity = this->_intensity_image.template at<uint16_t>(bin_rows, bin_cols);
-    if (current_written_depth < dist_to_sensor) {
-      // write this point to the image only if it is closer
+    if (current_written_depth <= 0.0f || dist_to_sensor < current_written_depth) {
+      // keep the closest point per pixel to reduce occlusion artifacts
       current_written_depth = dist_to_sensor;
       current_written_intensity = intensity;
+      projected_points++;
     }
   }
+  
+  // Log statistics for debugging
+  static int frame_count = 0;
+  std::cout << "Frame " << frame_count++ << " - Total points: " << cloud->points.size() 
+            << ", Projected: " << projected_points 
+            << ", Skipped (too close): " << skipped_too_close << std::endl;
+  if (non_zero_intensity_points > 0) {
+    std::cout << "  Intensity range: [" << min_intensity << ", " << max_intensity 
+              << "] from " << non_zero_intensity_points << " non-zero points" << std::endl;
+  } else {
+    std::cout << "  WARNING: ALL intensity values are ZERO!" << std::endl;
+  }
+  
+  fixDepthSystematicErrorIfNeeded();
+}
+
+void CloudProjection::initFromPoints(const pcl::PointCloud<pcl::PointXYZIT>::ConstPtr& cloud) 
+{
+  // XYZIT points with time offset for motion compensation support (Aeva lidar)
+  
+  size_t projected_points = 0;
+  size_t skipped_too_close = 0;
+  
+  for (size_t index = 0; index < cloud->points.size(); ++index) {
+    const auto& point = cloud->points[index];
+    if (std::isnan(point.x) || std::isnan(point.y) || std::isnan(point.z)) {
+      continue;
+    }
+    
+    Eigen::Vector3f point_vec(point.x, point.y, point.z);
+    
+    // Motion compensation: Transform point backwards in time to scan start
+    // This undoes the vehicle motion that occurred during the scan
+    if (_use_motion_compensation) {
+      float t = static_cast<float>(point.time_offset_ns) * 1e-9f;
+      if (std::abs(t) > 1e-6f) {
+        // The sensor moved during the scan. We need to undo this motion.
+        // Transform: P_compensated = R^(-1) * (P_measured - v*t)
+        // where R is the rotation that occurred during time t
+        
+        // Step 1: Remove translation that occurred during time t
+        Eigen::Vector3f point_translated = point_vec - _linear_velocity * t;
+        
+        // Step 2: Apply inverse rotation using Rodrigues' formula
+        Eigen::Vector3f w = _angular_velocity;
+        float w_norm = w.norm();
+        
+        if (w_norm > 1e-6f) {
+          // Rotation angle (negative for inverse rotation)
+          float angle = -w_norm * t;
+          Eigen::Vector3f axis = w / w_norm;
+          
+          // Rodrigues' rotation formula
+          Eigen::Matrix3f K;
+          K << 0.0f, -axis.z(), axis.y(),
+               axis.z(), 0.0f, -axis.x(),
+               -axis.y(), axis.x(), 0.0f;
+          
+          Eigen::Matrix3f rotation_inv = Eigen::Matrix3f::Identity()
+                                        + std::sin(angle) * K
+                                        + (1.0f - std::cos(angle)) * (K * K);
+          
+          point_vec = rotation_inv * point_translated;
+        } else {
+          // No rotation, just translation compensation
+          point_vec = point_translated;
+        }
+      }
+    }
+
+    float dist_to_sensor = point_vec.norm();
+    if (dist_to_sensor < 0.01f) {
+      skipped_too_close++;
+      continue;
+    }
+    
+    // Handle negative dBm intensity values (Aeva lidar)
+    uint16_t intensity = 0;
+    if (point.intensity != 0.0f) {
+      if (point.intensity < 0.0f) {
+        // Aeva dBm: typically -20 to -120 dBm
+        float dbm_val = -point.intensity;  // Make positive
+        dbm_val = std::max(20.0f, std::min(dbm_val, 120.0f));  // Clamp to [20, 120]
+        // Map [20, 120] dBm to [65535, 0] - stronger signal (lower dBm magnitude) = brighter
+        intensity = (uint16_t)(((120.0f - dbm_val) / 100.0f) * 65535.0f);
+      } else {
+        // Positive intensity (non-Aeva lidars)
+        float intensity_val = std::max(0.0f, std::min(point.intensity, 255.0f));
+        intensity = (uint16_t)(intensity_val * 256.0f);
+      }
+    }
+    
+    Angle angle_rows = Angle::fromRadians(std::atan2(point_vec.z(), std::sqrt(point_vec.x() * point_vec.x() + point_vec.y() * point_vec.y())));
+    Angle angle_cols = Angle::fromRadians(std::atan2(point_vec.y(), point_vec.x()));
+    
+    size_t bin_rows = this->_params.rowFromAngle(angle_rows);
+    size_t bin_cols = this->_params.colFromAngle(angle_cols);
+    
+    this->at(bin_rows, bin_cols).points().push_back(index);
+    auto& current_written_depth = this->_depth_image.template at<float>(bin_rows, bin_cols);
+    auto& current_written_intensity = this->_intensity_image.template at<uint16_t>(bin_rows, bin_cols);
+    if (current_written_depth <= 0.0f || dist_to_sensor < current_written_depth) {
+      // keep the closest point per pixel to reduce occlusion artifacts
+      current_written_depth = dist_to_sensor;
+      current_written_intensity = intensity;
+      projected_points++;
+    }
+  }
+  
+  // Log statistics (similar to XYZI but note time offset support)
+  static int frame_count = 0;
+  std::cout << "Frame " << frame_count++ << " (XYZIT with time offset) - Total points: " << cloud->points.size() 
+            << ", Projected: " << projected_points 
+            << ", Skipped (too close): " << skipped_too_close << std::endl;
+  
   fixDepthSystematicErrorIfNeeded();
 }
 
@@ -171,8 +342,8 @@ void CloudProjection::initFromPoints(const pcl::PointCloud<pcl::PointXYZIR>::Con
     this->at(bin_rows, bin_cols).points().push_back(index);
     auto& current_written_depth = this->_depth_image.template at<float>(bin_rows, bin_cols);
     auto& current_written_intensity = this->_intensity_image.template at<uint16_t>(bin_rows, bin_cols);
-    if (current_written_depth < dist_to_sensor) {
-      // write this point to the image only if it is closer
+    if (current_written_depth <= 0.0f || dist_to_sensor < current_written_depth) {
+      // keep the closest point per pixel to reduce occlusion artifacts
       current_written_depth = dist_to_sensor;
       current_written_intensity = intensity;
     }
@@ -200,8 +371,8 @@ void CloudProjection::initFromPoints(const pcl::PointCloud<pcl::PointXYZIF>::Con
     auto& current_written_depth = this->_depth_image.template at<float>(bin_rows, bin_cols);
     auto& current_written_intensity = this->_intensity_image.template at<uint16_t>(bin_rows, bin_cols);
     auto& current_written_reflectivity = this->_reflectance_image.template at<uint16_t>(bin_rows, bin_cols);
-    if (current_written_depth < dist_to_sensor) {
-      // write this point to the image only if it is closer
+    if (current_written_depth <= 0.0f || dist_to_sensor < current_written_depth) {
+      // keep the closest point per pixel to reduce occlusion artifacts
       current_written_depth = dist_to_sensor;
       current_written_intensity = intensity;
       current_written_reflectivity = reflectivity;
@@ -232,8 +403,8 @@ void CloudProjection::initFromPoints(const pcl::PointCloud<pcl::PointXYZIFN>::Co
     auto& current_written_intensity = this->_intensity_image.template at<uint16_t>(bin_rows, bin_cols);
     auto& current_written_reflectivity = this->_reflectance_image.template at<uint16_t>(bin_rows, bin_cols);
     auto& current_written_noise = this->_noise_image.template at<uint16_t>(bin_rows, bin_cols);
-    if (current_written_depth < dist_to_sensor) {
-      // write this point to the image only if it is closer
+    if (current_written_depth <= 0.0f || dist_to_sensor < current_written_depth) {
+      // keep the closest point per pixel to reduce occlusion artifacts
       current_written_depth = dist_to_sensor;
       current_written_intensity = intensity;
       current_written_reflectivity = reflectivity;

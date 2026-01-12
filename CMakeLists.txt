@@ -24,6 +24,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(image_transport REQUIRED)
@@ -78,6 +79,7 @@ ament_target_dependencies(cloud2image
   rclcpp
   sensor_msgs
   std_msgs
+  nav_msgs
   pcl_conversions
   cv_bridge
   image_transport

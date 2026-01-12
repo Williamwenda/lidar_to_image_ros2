@@ -64,6 +64,7 @@ class CloudProjection {
      */
     void initFromPoints(const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& cloud);
     void initFromPoints(const pcl::PointCloud<pcl::PointXYZI>::ConstPtr& cloud);
+    void initFromPoints(const pcl::PointCloud<pcl::PointXYZIT>::ConstPtr& cloud);
     void initFromPoints(const pcl::PointCloud<pcl::PointXYZIR>::ConstPtr& cloud);
     void initFromPoints(const pcl::PointCloud<pcl::PointXYZIF>::ConstPtr& cloud);
     void initFromPoints(const pcl::PointCloud<pcl::PointXYZIFN>::ConstPtr& cloud);
@@ -166,6 +167,10 @@ class CloudProjection {
     void loadMossmanCorrections();
     void clearCorrections();
 
+    void setMotionCompensation(bool enable,
+                               const Eigen::Vector3f& linear_velocity,
+                               const Eigen::Vector3f& angular_velocity);
+
   private:
     static cv::Mat fixKITTIDepth(const cv::Mat& original);
 
@@ -184,6 +189,10 @@ class CloudProjection {
     cv::Mat _noise_image;
 
     std::vector<float> _corrections;
+
+    bool _use_motion_compensation{false};
+    Eigen::Vector3f _linear_velocity{Eigen::Vector3f::Zero()};
+    Eigen::Vector3f _angular_velocity{Eigen::Vector3f::Zero()};
 };
 
 /**

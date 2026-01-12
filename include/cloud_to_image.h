@@ -9,6 +9,7 @@
 #include <std_msgs/msg/header.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
 
@@ -24,6 +25,7 @@ class CloudToImage : public rclcpp::Node
 
 		void init();
 		void pointCloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr input);
+		void odometryCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
 		void publishImages(const std_msgs::msg::Header& header);
 		void saveImages(const std::string& base_name = std::string("cloud2image"));
 
@@ -83,12 +85,20 @@ class CloudToImage : public rclcpp::Node
 		cv::Mat _stack_image;
 		
 		rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr _sub_PointCloud;
+		rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr _sub_Odometry;
 		rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr _pub_DepthImage;
 		rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr _pub_IntensityImage;
 		rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr _pub_ReflectanceImage;
 		rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr _pub_NoiseImage;
 		rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr _pub_GroupImage;
 		rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr _pub_StackImage;
+		
+		// Motion compensation data
+		bool _motion_compensation;
+		std::string _odom_topic;
+		Eigen::Vector3f _latest_linear_velocity;
+		Eigen::Vector3f _latest_angular_velocity;
+		bool _has_odom_data;
 };
 }
 
