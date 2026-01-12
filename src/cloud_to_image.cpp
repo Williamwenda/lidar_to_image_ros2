@@ -31,6 +31,7 @@ CloudToImage::CloudToImage():
 	_equalize(false),
 	_flip(false),
 	_fill_gaps(true),  // Enable gap filling by default
+	_fill_gaps_method(0),  // Conservative gap filling by default
 	_overlapping(0),
 	_output_mode(ImageOutputMode::SINGLE),
 	_motion_compensation(false),
@@ -122,6 +123,7 @@ void CloudToImage::init()
 	_equalize = getParam("equalize", false);
 	_flip = getParam("flip", false);
 	_fill_gaps = getParam("fill_gaps", true);  // Enable gap filling by default
+	_fill_gaps_method = getParam("fill_gaps_method", 0);  // 0=conservative, 1=moderate, 2=aggressive
 	
 	// Video recording parameters
 	_record_video = getParam("record_video", false);
@@ -326,16 +328,17 @@ void CloudToImage::pointCloudCallback(const sensor_msgs::msg::PointCloud2::Share
 	// Fill gaps in images to remove black bars/artifacts
 	if (_fill_gaps) {
 		if (_has_depth_image) {
-			fillGaps(_depth_image);
+			fillGaps(_depth_image, _fill_gaps_method);
 		}
 		if (_has_intensity_image) {
-			fillGaps(_intensity_image);
+			// Use depth-guided filling for intensity to preserve edges
+			fillGaps(_intensity_image, _fill_gaps_method, _has_depth_image ? &_depth_image : nullptr);
 		}
 		if (_has_reflectance_image) {
-			fillGaps(_reflectance_image);
+			fillGaps(_reflectance_image, _fill_gaps_method, _has_depth_image ? &_depth_image : nullptr);
 		}
 		if (_has_noise_image) {
-			fillGaps(_noise_image);
+			fillGaps(_noise_image, _fill_gaps_method);
 		}
 	}
 	
@@ -737,17 +740,194 @@ void CloudToImage::saveImages(const std::string& base_name)
 	}
 }
 
-void CloudToImage::fillGaps(cv::Mat& image, int method)
+void CloudToImage::fillGaps(cv::Mat& image, int method, const cv::Mat* depth_image)
 {
-	// Multi-pass gap filling optimized for both organized (Ouster) and unorganized (Aeva) point clouds
-	// For unorganized clouds with motion distortion, we use moderate gap filling to avoid artifacts
-	// Pass 1: Small horizontal gaps with strict similarity (1-3 pixels)
-	// Pass 2: Medium horizontal gaps with relaxed similarity (4-8 pixels)  
-	// Pass 3: Vertical interpolation with consistency check
-	// Pass 4: 8-neighbor averaging (conservative - at least 5 neighbors)
-	// Pass 5: 8-neighbor averaging (moderate - at least 4 neighbors)
+	// Improved gap filling that preserves details while reducing black bars
+	// Method 0 (conservative): Only fills 1-2 pixel gaps with strict similarity
+	// Method 1 (moderate): Fills up to 3-5 pixel gaps with relaxed similarity  
+	// Method 2 (aggressive): Original 5-pass method (may blur details)
+	//
+	// Key improvements:
+	// - Depth-guided filling for intensity images (avoids mixing different surfaces)
+	// - Stricter similarity thresholds to preserve edges
+	// - Fewer passes to reduce over-smoothing
+	// - Horizontal priority (lidar scans are more coherent horizontally)
 	
-	(void)method;  // Method parameter reserved for future use
+	if (image.empty()) return;
+	
+	// Method 2: Original aggressive 5-pass method (for backwards compatibility)
+	if (method == 2) {
+		fillGapsAggressive(image);
+		return;
+	}
+	
+	// Conservative (0) and Moderate (1) methods with depth guidance
+	int max_gap_size_pass1 = (method == 0) ? 2 : 3;
+	int max_gap_size_pass2 = (method == 0) ? 0 : 5;  // Skip pass 2 in conservative mode
+	float similarity_threshold_pass1 = (method == 0) ? 0.15f : 0.25f;
+	float similarity_threshold_pass2 = 0.40f;
+	
+	if (image.type() == CV_32FC1) {
+		// For float depth images
+		
+		// Pass 1: Fill small horizontal gaps with strict similarity
+		for (int row = 0; row < image.rows; row++) {
+			float* row_ptr = image.ptr<float>(row);
+			
+			int start_valid = -1;
+			for (int col = 0; col < image.cols; col++) {
+				if (row_ptr[col] > 0.0f) {
+					if (start_valid >= 0 && col - start_valid > 1) {
+						int gap_size = col - start_valid - 1;
+						if (gap_size <= max_gap_size_pass1) {
+							float start_val = row_ptr[start_valid];
+							float end_val = row_ptr[col];
+							float max_val = std::max(start_val, end_val);
+							if (max_val > 0.0f && std::abs(end_val - start_val) / max_val < similarity_threshold_pass1) {
+								// Linear interpolation
+								for (int i = 1; i <= gap_size; i++) {
+									float ratio = (float)i / (gap_size + 1);
+									row_ptr[start_valid + i] = start_val + ratio * (end_val - start_val);
+								}
+							}
+						}
+					}
+					start_valid = col;
+				}
+			}
+		}
+		
+		// Pass 2: Fill medium horizontal gaps (moderate mode only)
+		if (max_gap_size_pass2 > 0) {
+			for (int row = 0; row < image.rows; row++) {
+				float* row_ptr = image.ptr<float>(row);
+				
+				int start_valid = -1;
+				for (int col = 0; col < image.cols; col++) {
+					if (row_ptr[col] > 0.0f) {
+						if (start_valid >= 0 && col - start_valid > 1) {
+							int gap_size = col - start_valid - 1;
+							if (gap_size > max_gap_size_pass1 && gap_size <= max_gap_size_pass2) {
+								float start_val = row_ptr[start_valid];
+								float end_val = row_ptr[col];
+								float max_val = std::max(start_val, end_val);
+								if (max_val > 0.0f && std::abs(end_val - start_val) / max_val < similarity_threshold_pass2) {
+									for (int i = 1; i <= gap_size; i++) {
+										float ratio = (float)i / (gap_size + 1);
+										row_ptr[start_valid + i] = start_val + ratio * (end_val - start_val);
+									}
+								}
+							}
+						}
+						start_valid = col;
+					}
+				}
+			}
+		}
+		
+	} else if (image.type() == CV_16UC1) {
+		// For uint16 intensity/reflectance/noise images
+		
+		// Check if we have depth guidance
+		bool use_depth_guidance = (depth_image != nullptr && !depth_image->empty() && 
+		                            depth_image->type() == CV_32FC1 &&
+		                            depth_image->rows == image.rows && 
+		                            depth_image->cols == image.cols);
+		
+		// Pass 1: Fill small horizontal gaps with strict similarity
+		for (int row = 0; row < image.rows; row++) {
+			uint16_t* row_ptr = image.ptr<uint16_t>(row);
+			const float* depth_row = use_depth_guidance ? depth_image->ptr<float>(row) : nullptr;
+			
+			int start_valid = -1;
+			for (int col = 0; col < image.cols; col++) {
+				if (row_ptr[col] > 0) {
+					if (start_valid >= 0 && col - start_valid > 1) {
+						int gap_size = col - start_valid - 1;
+						if (gap_size <= max_gap_size_pass1) {
+							uint16_t start_val = row_ptr[start_valid];
+							uint16_t end_val = row_ptr[col];
+							uint16_t max_val = std::max(start_val, end_val);
+							
+							// Check intensity similarity
+							bool intensity_similar = (max_val > 0 && 
+							                          std::abs((int)end_val - (int)start_val) * 100 / max_val < (int)(similarity_threshold_pass1 * 100));
+							
+							// Check depth similarity if available (avoid mixing different surfaces)
+							bool depth_similar = true;
+							if (use_depth_guidance && depth_row) {
+								float start_depth = depth_row[start_valid];
+								float end_depth = depth_row[col];
+								if (start_depth > 0.0f && end_depth > 0.0f) {
+									float max_depth = std::max(start_depth, end_depth);
+									// Stricter depth threshold - surfaces must be very similar
+									depth_similar = (std::abs(end_depth - start_depth) / max_depth < 0.10f);
+								}
+							}
+							
+							if (intensity_similar && depth_similar) {
+								// Linear interpolation
+								for (int i = 1; i <= gap_size; i++) {
+									float ratio = (float)i / (gap_size + 1);
+									row_ptr[start_valid + i] = (uint16_t)(start_val + ratio * (end_val - start_val));
+								}
+							}
+						}
+					}
+					start_valid = col;
+				}
+			}
+		}
+		
+		// Pass 2: Fill medium horizontal gaps (moderate mode only)
+		if (max_gap_size_pass2 > 0) {
+			for (int row = 0; row < image.rows; row++) {
+				uint16_t* row_ptr = image.ptr<uint16_t>(row);
+				const float* depth_row = use_depth_guidance ? depth_image->ptr<float>(row) : nullptr;
+				
+				int start_valid = -1;
+				for (int col = 0; col < image.cols; col++) {
+					if (row_ptr[col] > 0) {
+						if (start_valid >= 0 && col - start_valid > 1) {
+							int gap_size = col - start_valid - 1;
+							if (gap_size > max_gap_size_pass1 && gap_size <= max_gap_size_pass2) {
+								uint16_t start_val = row_ptr[start_valid];
+								uint16_t end_val = row_ptr[col];
+								uint16_t max_val = std::max(start_val, end_val);
+								
+								bool intensity_similar = (max_val > 0 && 
+								                          std::abs((int)end_val - (int)start_val) * 100 / max_val < (int)(similarity_threshold_pass2 * 100));
+								
+								bool depth_similar = true;
+								if (use_depth_guidance && depth_row) {
+									float start_depth = depth_row[start_valid];
+									float end_depth = depth_row[col];
+									if (start_depth > 0.0f && end_depth > 0.0f) {
+										float max_depth = std::max(start_depth, end_depth);
+										depth_similar = (std::abs(end_depth - start_depth) / max_depth < 0.20f);
+									}
+								}
+								
+								if (intensity_similar && depth_similar) {
+									for (int i = 1; i <= gap_size; i++) {
+										float ratio = (float)i / (gap_size + 1);
+										row_ptr[start_valid + i] = (uint16_t)(start_val + ratio * (end_val - start_val));
+									}
+								}
+							}
+						}
+						start_valid = col;
+					}
+				}
+			}
+		}
+	}
+}
+
+void CloudToImage::fillGapsAggressive(cv::Mat& image)
+{
+	// Original aggressive 5-pass gap filling method
+	// This may blur details but fills more gaps
 	
 	if (image.empty()) return;
 	

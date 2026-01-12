@@ -48,7 +48,13 @@ class CloudToImage : public rclcpp::Node
 		static std::string timeToStr(T ros_t);
 		
 		//! \brief fillGaps Fill missing data gaps in images using interpolation
-		void fillGaps(cv::Mat& image, int method = 0);
+		//! \param image The image to fill (depth or intensity)
+		//! \param method 0=conservative (default), 1=moderate, 2=aggressive
+		//! \param depth_image Optional depth image for depth-guided intensity filling
+		void fillGaps(cv::Mat& image, int method = 0, const cv::Mat* depth_image = nullptr);
+		
+		//! \brief fillGapsAggressive Original 5-pass aggressive gap filling (may blur details)
+		void fillGapsAggressive(cv::Mat& image);
 
 	private:
 		CloudProjection* _cloud_proj;
@@ -71,6 +77,7 @@ class CloudToImage : public rclcpp::Node
 		bool _equalize;
 		bool _flip;
 		bool _fill_gaps;  // Fill missing data gaps
+		int _fill_gaps_method;  // 0=conservative, 1=moderate, 2=aggressive
 		
 		// Video recording
 		bool _record_video;

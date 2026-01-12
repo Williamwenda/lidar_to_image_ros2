@@ -68,6 +68,12 @@ def generate_launch_description():
         description='Enable gap filling to remove black horizontal bars'
     )
     
+    fill_gaps_method_arg = DeclareLaunchArgument(
+        'fill_gaps_method',
+        default_value='0',
+        description='Gap filling aggressiveness: 0=conservative (preserves details), 1=moderate, 2=aggressive (may blur)'
+    )
+    
     record_video_arg = DeclareLaunchArgument(
         'record_video',
         default_value='false',
@@ -129,6 +135,7 @@ def generate_launch_description():
             'equalize': False,
             'flip': True,
             'fill_gaps': LaunchConfiguration('fill_gaps'),
+            'fill_gaps_method': LaunchConfiguration('fill_gaps_method'),
             'motion_compensation': LaunchConfiguration('motion_compensation'),
             'odom_topic': LaunchConfiguration('odom_topic'),
             'record_video': LaunchConfiguration('record_video'),
@@ -150,6 +157,7 @@ def generate_launch_description():
         odom_topic_arg,
         output_mode_arg,
         fill_gaps_arg,
+        fill_gaps_method_arg,
         record_video_arg,
         video_output_path_arg,
         video_fps_arg,
