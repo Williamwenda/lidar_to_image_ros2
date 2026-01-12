@@ -34,7 +34,12 @@ CloudToImage::CloudToImage():
 	_overlapping(0),
 	_output_mode(ImageOutputMode::SINGLE),
 	_motion_compensation(false),
-	_has_odom_data(false)
+	_has_odom_data(false),
+	_record_video(false),
+	_video_fps(10),
+	_intensity_gamma(0.6),
+	_intensity_percentile_low(0.005),
+	_intensity_percentile_high(0.998)
 {
 	_depth_image = cv::Mat::zeros(1, 1, CV_32FC1);
 	_intensity_image = cv::Mat::zeros(1, 1, CV_16UC1);
@@ -49,6 +54,16 @@ CloudToImage::CloudToImage():
 
 CloudToImage::~CloudToImage() 
 {
+	// Close video writers if recording
+	if (_video_writer_depth.isOpened()) {
+		_video_writer_depth.release();
+		RCLCPP_INFO(this->get_logger(), "Closed depth video writer");
+	}
+	if (_video_writer_intensity.isOpened()) {
+		_video_writer_intensity.release();
+		RCLCPP_INFO(this->get_logger(), "Closed intensity video writer");
+	}
+	
 	if (_cloud_proj) {
 		delete _cloud_proj;
 	}
@@ -107,6 +122,16 @@ void CloudToImage::init()
 	_equalize = getParam("equalize", false);
 	_flip = getParam("flip", false);
 	_fill_gaps = getParam("fill_gaps", true);  // Enable gap filling by default
+	
+	// Video recording parameters
+	_record_video = getParam("record_video", false);
+	_video_output_path = getParam("video_output_path", std::string("./lidar_video"));
+	_video_fps = getParam("video_fps", 10);
+	
+	// Intensity visualization parameters (adjustable)
+	_intensity_gamma = getParam("intensity_gamma", 0.6);
+	_intensity_percentile_low = getParam("intensity_percentile_low", 0.005);
+	_intensity_percentile_high = getParam("intensity_percentile_high", 0.998);
 	
 	_equalize = _equalize && _8bpp; //no equalization for non 8bpp images
 
@@ -351,13 +376,41 @@ void CloudToImage::publishImages(const std_msgs::msg::Header& header)
 			if (_flip) cv::flip( mono_img, mono_img, 1);
 			sensor_msgs::msg::Image::SharedPtr depth_img = cv_bridge::CvImage(header, encoding, mono_img).toImageMsg();
 			_pub_DepthImage->publish(*depth_img);
+			
+			// Record depth video if enabled
+			if (_record_video) {
+				// Convert to 8-bit for video if needed
+				cv::Mat video_frame;
+				if (mono_img.type() == CV_8UC1) {
+					video_frame = mono_img;
+				} else {
+					mono_img.convertTo(video_frame, CV_8UC1, 255.0 / 65535.0);
+				}
+				
+				if (!_video_writer_depth.isOpened()) {
+					// Initialize video writer on first frame
+					std::string filename = _video_output_path + "_depth.mp4";
+					int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
+					cv::Size frame_size = video_frame.size();
+					_video_writer_depth.open(filename, fourcc, _video_fps, frame_size, false);  // false = grayscale
+					if (_video_writer_depth.isOpened()) {
+						RCLCPP_INFO(this->get_logger(), "Recording depth video to: %s (size: %dx%d, fps: %d)", 
+							filename.c_str(), frame_size.width, frame_size.height, _video_fps);
+					} else {
+						RCLCPP_ERROR(this->get_logger(), "Failed to open video writer for: %s", filename.c_str());
+					}
+				}
+				if (_video_writer_depth.isOpened()) {
+					_video_writer_depth.write(video_frame);
+				}
+			}
+			
 			if (_8bpp) _depth_image = mono_img;
 		}
 		if (_has_intensity_image && _pub_IntensityImage->get_subscription_count() > 0) {
 			cv::Mat mono_img = cv::Mat(_intensity_image.size(), mode);
 			
-			// Better normalization: use percentile-based approach to avoid outliers
-			// This gives much better contrast for Ouster data
+			// Use adjustable percentiles to preserve detail and avoid over-brightening
 			cv::Mat non_zero_mask = _intensity_image > 0;
 			
 			if (cv::countNonZero(non_zero_mask) > 0) {
@@ -374,14 +427,32 @@ void CloudToImage::publishImages(const std_msgs::msg::Header& header)
 				}
 				
 				std::sort(intensity_values.begin(), intensity_values.end());
-				size_t idx_low = intensity_values.size() * 0.02;  // 2nd percentile
-				size_t idx_high = intensity_values.size() * 0.98; // 98th percentile
+				
+				// Use configurable percentiles (default: 0.5th to 99.8th)
+				size_t idx_low = intensity_values.size() * _intensity_percentile_low;
+				size_t idx_high = intensity_values.size() * _intensity_percentile_high;
 				double min_val = intensity_values[idx_low];
 				double max_val = intensity_values[idx_high];
 				
-				// Normalize using percentile range for better contrast
+				// Apply gamma correction to darken and recover texture details
+				// Lower gamma = darker image with more visible details in bright areas
 				_intensity_image.convertTo(mono_img, mode, max_range / (max_val - min_val), -min_val * max_range / (max_val - min_val));
 				mono_img.setTo(0, ~non_zero_mask); // Keep zeros as zero
+				
+				// Apply gamma correction with configurable gamma value
+				if (mode == CV_8UC1) {
+					cv::Mat lookup_table(1, 256, CV_8U);
+					for (int i = 0; i < 256; i++) {
+						lookup_table.at<uint8_t>(i) = cv::saturate_cast<uint8_t>(std::pow(i / 255.0, _intensity_gamma) * 255.0);
+					}
+					cv::LUT(mono_img, lookup_table, mono_img);
+				} else {
+					// For 16-bit, apply gamma directly
+					mono_img.convertTo(mono_img, CV_32F);
+					cv::pow(mono_img / max_range, _intensity_gamma, mono_img);
+					mono_img = mono_img * max_range;
+					mono_img.convertTo(mono_img, mode);
+				}
 				
 				// Clamp values to valid range
 				cv::threshold(mono_img, mono_img, max_range, max_range, cv::THRESH_TRUNC);
@@ -395,6 +466,36 @@ void CloudToImage::publishImages(const std_msgs::msg::Header& header)
 			if (_flip) cv::flip( mono_img, mono_img, 1);
 			sensor_msgs::msg::Image::SharedPtr intensity_img = cv_bridge::CvImage(header, encoding, mono_img).toImageMsg();
 			_pub_IntensityImage->publish(*intensity_img);
+			
+			// Record intensity video if enabled
+			if (_record_video) {
+				// Convert to 8-bit for video if needed
+				cv::Mat video_frame;
+				if (mono_img.type() == CV_8UC1) {
+					video_frame = mono_img;
+				} else {
+					mono_img.convertTo(video_frame, CV_8UC1, 255.0 / 65535.0);
+				}
+				
+				if (!_video_writer_intensity.isOpened()) {
+					// Initialize video writer on first frame
+					std::string filename = _video_output_path + "_intensity.mp4";
+					int fourcc = cv::VideoWriter::fourcc('m', 'p', '4', 'v');
+					cv::Size frame_size = video_frame.size();
+					_video_writer_intensity.open(filename, fourcc, _video_fps, frame_size, false);  // false = grayscale
+					if (_video_writer_intensity.isOpened()) {
+						RCLCPP_INFO(this->get_logger(), "Recording intensity video to: %s (size: %dx%d, fps: %d)", 
+							filename.c_str(), frame_size.width, frame_size.height, _video_fps);
+					} else {
+						RCLCPP_ERROR(this->get_logger(), "Failed to open video writer for: %s", filename.c_str());
+						_record_video = false;
+					}
+				}
+				if (_video_writer_intensity.isOpened()) {
+					_video_writer_intensity.write(video_frame);
+				}
+			}
+			
 			if (_8bpp) _intensity_image = mono_img;
 		}
 		if (_has_reflectance_image && _pub_ReflectanceImage->get_subscription_count() > 0) {

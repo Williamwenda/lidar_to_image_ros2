@@ -68,6 +68,30 @@ def generate_launch_description():
         description='Enable gap filling to remove black horizontal bars'
     )
     
+    record_video_arg = DeclareLaunchArgument(
+        'record_video',
+        default_value='false',
+        description='Enable video recording of depth and intensity images'
+    )
+    
+    video_output_path_arg = DeclareLaunchArgument(
+        'video_output_path',
+        default_value='./aeva_lidar_video',
+        description='Output path prefix for video files (without extension)'
+    )
+    
+    video_fps_arg = DeclareLaunchArgument(
+        'video_fps',
+        default_value='10',
+        description='Video recording frame rate (fps)'
+    )
+    
+    intensity_gamma_arg = DeclareLaunchArgument(
+        'intensity_gamma',
+        default_value='0.6',
+        description='Gamma correction for intensity (0.5=darker/more detail, 0.6=balanced, 1.0=linear)'
+    )
+    
     # ROS2 bag play command
     bag_play = ExecuteProcess(
         cmd=['ros2', 'bag', 'play', 
@@ -107,6 +131,12 @@ def generate_launch_description():
             'fill_gaps': LaunchConfiguration('fill_gaps'),
             'motion_compensation': LaunchConfiguration('motion_compensation'),
             'odom_topic': LaunchConfiguration('odom_topic'),
+            'record_video': LaunchConfiguration('record_video'),
+            'video_output_path': LaunchConfiguration('video_output_path'),
+            'video_fps': LaunchConfiguration('video_fps'),
+            'intensity_gamma': LaunchConfiguration('intensity_gamma'),
+            'intensity_percentile_low': 0.005,
+            'intensity_percentile_high': 0.998,
         }]
     )
     
@@ -120,6 +150,10 @@ def generate_launch_description():
         odom_topic_arg,
         output_mode_arg,
         fill_gaps_arg,
+        record_video_arg,
+        video_output_path_arg,
+        video_fps_arg,
+        intensity_gamma_arg,
         bag_play,
         cloud2image_node
     ])

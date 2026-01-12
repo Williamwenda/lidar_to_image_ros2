@@ -12,6 +12,8 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
+#include <opencv2/core/core.hpp>
+#include <opencv2/videoio.hpp>
 
 namespace cloud_to_image
 {
@@ -69,6 +71,18 @@ class CloudToImage : public rclcpp::Node
 		bool _equalize;
 		bool _flip;
 		bool _fill_gaps;  // Fill missing data gaps
+		
+		// Video recording
+		bool _record_video;
+		std::string _video_output_path;
+		cv::VideoWriter _video_writer_depth;
+		cv::VideoWriter _video_writer_intensity;
+		int _video_fps;
+		
+		// Intensity visualization parameters
+		double _intensity_gamma;
+		double _intensity_percentile_low;
+		double _intensity_percentile_high;
 
 		float _horizontal_scale;
 		float _vertical_scale;

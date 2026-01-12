@@ -216,6 +216,12 @@ void CloudProjection::initFromPoints(const pcl::PointCloud<pcl::PointXYZIT>::Con
   size_t projected_points = 0;
   size_t skipped_too_close = 0;
   
+  // Track actual angle ranges to verify FOV
+  float min_vertical_angle_deg = 90.0f;
+  float max_vertical_angle_deg = -90.0f;
+  float min_horizontal_angle_deg = 180.0f;
+  float max_horizontal_angle_deg = -180.0f;
+  
   for (size_t index = 0; index < cloud->points.size(); ++index) {
     const auto& point = cloud->points[index];
     if (std::isnan(point.x) || std::isnan(point.y) || std::isnan(point.z)) {
@@ -288,6 +294,14 @@ void CloudProjection::initFromPoints(const pcl::PointCloud<pcl::PointXYZIT>::Con
     Angle angle_rows = Angle::fromRadians(std::atan2(point_vec.z(), std::sqrt(point_vec.x() * point_vec.x() + point_vec.y() * point_vec.y())));
     Angle angle_cols = Angle::fromRadians(std::atan2(point_vec.y(), point_vec.x()));
     
+    // Track actual angle ranges
+    float vert_angle_deg = angle_rows.toDegrees();
+    float horiz_angle_deg = angle_cols.toDegrees();
+    min_vertical_angle_deg = std::min(min_vertical_angle_deg, vert_angle_deg);
+    max_vertical_angle_deg = std::max(max_vertical_angle_deg, vert_angle_deg);
+    min_horizontal_angle_deg = std::min(min_horizontal_angle_deg, horiz_angle_deg);
+    max_horizontal_angle_deg = std::max(max_horizontal_angle_deg, horiz_angle_deg);
+    
     size_t bin_rows = this->_params.rowFromAngle(angle_rows);
     size_t bin_cols = this->_params.colFromAngle(angle_cols);
     
@@ -302,11 +316,22 @@ void CloudProjection::initFromPoints(const pcl::PointCloud<pcl::PointXYZIT>::Con
     }
   }
   
-  // Log statistics (similar to XYZI but note time offset support)
+  // Log statistics including actual FOV observed
   static int frame_count = 0;
-  std::cout << "Frame " << frame_count++ << " (XYZIT with time offset) - Total points: " << cloud->points.size() 
+  std::cout << "Frame " << frame_count++ << " (XYZIT with motion compensation)" << std::endl;
+  std::cout << "  Total points: " << cloud->points.size() 
             << ", Projected: " << projected_points 
             << ", Skipped (too close): " << skipped_too_close << std::endl;
+  std::cout << "  Actual vertical FOV: [" << min_vertical_angle_deg << "°, " 
+            << max_vertical_angle_deg << "°] (range: " 
+            << (max_vertical_angle_deg - min_vertical_angle_deg) << "°)" << std::endl;
+  std::cout << "  Actual horizontal FOV: [" << min_horizontal_angle_deg << "°, " 
+            << max_horizontal_angle_deg << "°] (range: " 
+            << (max_horizontal_angle_deg - min_horizontal_angle_deg) << "°)" << std::endl;
+  std::cout << "  Configured vertical FOV: [" << this->_params.v_start_angle().toDegrees() 
+            << "°, " << this->_params.v_end_angle().toDegrees() << "°]" << std::endl;
+  std::cout << "  Configured horizontal FOV: [" << this->_params.h_start_angle().toDegrees() 
+            << "°, " << this->_params.h_end_angle().toDegrees() << "°]" << std::endl;
   
   fixDepthSystematicErrorIfNeeded();
 }

@@ -152,9 +152,9 @@
 - name: AEVA-AERIES-II
   params:
     vertical_span:
-      start_angle: 15
-      end_angle: -15
-      step: 0.46875  # 30° / 64 rows = 0.46875° per row (matches num_rows: 64)
+      start_angle: 8
+      end_angle: -12
+      step: 0.3125  # 20° / 64 rows = 0.3125° per row (matches num_rows: 64)
     horizontal_span:
       start_angle: -57
       end_angle: 63
